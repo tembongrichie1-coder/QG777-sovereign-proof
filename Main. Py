@@ -1,0 +1,20 @@
+import hashlib, datetime, json, os
+DOSSIER = "QG777_BODYCAM"
+os.makedirs(DOSSIER, exist_ok=True)
+
+def sceller_preuve(agent, site, action):
+    heure = datetime.datetime.now().isoformat()
+    data = f"{agent}-{site}-{action}-{heure}-QG777"
+    empreinte = hashlib.sha256(data.encode()).hexdigest()
+    log = {"heure": heure, "agent": agent, "site": site, "action": action, "empreinte": f"0x{empreinte[:12]}", "hash": empreinte}
+    with open(f"{DOSSIER}/qg777.log", "a") as f:
+        f.write(json.dumps(log)+"\n")
+    print(f"[PREUVE SCELLÉE] {action} -> {log['empreinte']}")
+    return log
+
+print("=== QG777 BODYCAM SOUVERAINE ===")
+sceller_preuve("QG777", "La Defense", "Ronde_Entree")
+sceller_preuve("QG777", "La Defense", "Controle_Badge")
+sceller_preuve("QG777", "La Defense", "Ronde_Parking")
+sceller_preuve("QG777", "La Defense", "Incident_Scelle")
+sceller_preuve("QG777", "La Defense", "Fin_Service")
