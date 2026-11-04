@@ -1,0 +1,26 @@
+# 🛡️ QG777 Sovereign Core v4.3 - Blockchain Ledger
+
+**Le premier système de preuve inviolable pour la sécurité terrain - La Défense, Paris**
+
+> "Une ronde sans preuve est une ronde qui n'a jamais existé." - Richie Ahmed Tembong
+
+### 🎯 Le Problème
+Feuilles de ronde falsifiables. Vidéos non scellées. Aucune preuve en cas de litige.
+
+### ✅ Solution QG777
+Chaque ronde est scellée SHA-256 + horodatage blockchain de poche. Inviolable. Vérifiable.
+
+### ⚡ Stack v4.3
+- FastAPI v4.1 + SQLAlchemy
+- SHA-256 auto à chaque POST/PUT
+- Audit intégrité: /parcours/verifier-integrite
+- Client CLI v4.3 + Export JSON juridique
+- Auth X-API-KEY via .env
+
+### 🚀 Installation
+```bash
+pip install fastapi uvicorn sqlalchemy pydantic python-dotenv requests
+uvicorn main:app --reload
+python client.py verifier
+python client.py lister
+python client.py exporter
