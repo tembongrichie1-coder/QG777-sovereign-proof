@@ -24,3 +24,9 @@ python client.py verifier
 
 ### Auteur
 Richie Ahmed Tembong - Fondateur QG777 Systems
+---
+### Licence
+**Propriétaire - QG777 Systems**
+Code visible pour audit et recrutement uniquement.
+Usage commercial interdit sans accord écrit.
+© 2026 Richie Ahmed Tembong - La Défense
