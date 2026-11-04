@@ -1,0 +1,323 @@
+import asyncio
+import json
+import logging
+import time
+import hashlib
+import socket
+import struct
+import os
+import aiosqlite
+
+from dotenv import load_dotenv
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
+from web3 import Web3
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+class SovereignCoreDaemon:
+    def __init__(self, host: str, port: int, db_path: str = "sovereign_core.db", 
+                 rpc_url: str = None, contract_address: str = None, 
+                 evm_private_key: str = None, multicast_group: str = "239.255.255.250", 
+                 multicast_port: int = 5007):
+        self.host = host
+        self.port = port
+        self.db_path = db_path
+        self.known_peers = set()
+        self.seen_messages = set()
+        self.multicast_group = multicast_group
+        self.multicast_port = multicast_port
+        
+        # 1. Couche Cryptographique Ed25519
+        self.private_key = ed25519.Ed25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
+        self.public_key_hex = self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        ).hex()
+
+        self.db_queue = asyncio.Queue()
+        self.running = False
+        self.tasks = []
+
+        # 3. Configuration de l'Ancrage Blockchain (Web3) - SÉCURISÉ VIA .ENV
+        rpc_url = rpc_url or os.getenv("RPC_URL")
+        contract_address = contract_address or os.getenv("CONTRACT_ADDRESS")
+        evm_private_key = evm_private_key or os.getenv("EVM_PRIVATE_KEY")
+        
+        self.web3_enabled = all([rpc_url, contract_address, evm_private_key])
+        if self.web3_enabled:
+            try:
+                self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+                self.contract_address = Web3.to_checksum_address(contract_address)
+                self.evm_private_key = evm_private_key
+                self.account = self.w3.eth.account.from_key(evm_private_key)
+                self.contract_abi = [{
+                    "inputs": [
+                        {"internalType": "bytes32", "name": "batchId", "type": "bytes32"},
+                        {"internalType": "bytes32", "name": "dataHash", "type": "bytes32"},
+                        {"internalType": "uint256", "name": "messageCount", "type": "uint256"}
+                    ],
+                    "name": "anchorBatch",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function"
+                }]
+                self.contract = self.w3.eth.contract(address=self.contract_address, abi=self.contract_abi)
+                logging.info("Module d'ancrage Blockchain initialisé.")
+            except Exception as e:
+                logging.error(f"Échec d'initialisation Web3 : {e}")
+                self.web3_enabled = False
+
+    async def initialize_db(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""CREATE TABLE IF NOT EXISTS mesh_messages (
+                id TEXT PRIMARY KEY, sender_pubkey TEXT, payload TEXT, 
+                ttl INTEGER, signature TEXT, anchored INTEGER DEFAULT 0, received_at REAL)""")
+            await db.execute("""CREATE TABLE IF NOT EXISTS core_security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT, message TEXT, timestamp REAL)""")
+            await db.commit()
+        logging.info("Base de données SQLite prête.")
+
+    def sign_packet(self, packet_data: dict) -> str:
+        canonical_bytes = json.dumps(packet_data, sort_keys=True).encode("utf-8")
+        return self.private_key.sign(canonical_bytes).hex()
+
+    @staticmethod
+    def verify_packet(packet: dict) -> bool:
+        try:
+            signature_hex = packet.get("signature")
+            sender_hex = packet.get("sender")
+            if not signature_hex or not sender_hex:
+                return False
+            packet_to_verify = packet.copy()
+            packet_to_verify.pop("signature", None)
+            canonical_bytes = json.dumps(packet_to_verify, sort_keys=True).encode("utf-8")
+            pub_key = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(sender_hex))
+            pub_key.verify(bytes.fromhex(signature_hex), canonical_bytes)
+            return True
+        except (InvalidSignature, ValueError, Exception):
+            return False
+
+    async def db_worker(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            while self.running:
+                try:
+                    task_type, data = await self.db_queue.get()
+                    if task_type == "message":
+                        await db.execute("""INSERT OR IGNORE INTO mesh_messages 
+                            (id, sender_pubkey, payload, ttl, signature, anchored, received_at) 
+                            VALUES (?, ?, ?, ?, ?, 0, ?)""",
+                            (data["id"], data["sender"], json.dumps(data["payload"]), 
+                             data["ttl"], data["signature"], time.time()))
+                    elif task_type == "log":
+                        await db.execute("INSERT INTO core_security_logs (level, message, timestamp) VALUES (?, ?, ?)",
+                            (data["level"], data["message"], time.time()))
+                    await db.commit()
+                    self.db_queue.task_done()
+                except Exception as e:
+                    logging.error(f"Erreur du worker SQLite : {e}")
+
+    async def log_event(self, level: str, message: str):
+        await self.db_queue.put(("log", {"level": level, "message": message}))
+        logging.info(f"[{level}] {message}")
+
+    async def get_local_message_ids(self) -> list:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT id FROM mesh_messages") as cursor:
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows]
+
+    async def handle_sync_handshake(self, reader, writer, packet: dict):
+        action = packet.get("action")
+        if action == "SYNC_REQUEST_IDS":
+            local_ids = await self.get_local_message_ids()
+            response = {"action": "SYNC_IDS_RESPONSE", "ids": local_ids}
+            writer.write(json.dumps(response).encode("utf-8"))
+            await writer.drain()
+        elif action == "SYNC_FETCH_MESSAGES":
+            requested_ids = packet.get("ids", [])
+            messages = []
+            async with aiosqlite.connect(self.db_path) as db:
+                for m_id in requested_ids:
+                    async with db.execute("SELECT id, sender_pubkey, payload, ttl, signature, anchored, received_at FROM mesh_messages WHERE id = ?", (m_id,)) as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            messages.append({"id": row[0], "sender": row[1], "payload": json.loads(row[2]), "ttl": row[3], "signature": row[4], "anchored": row[5], "received_at": row[6]})
+            response = {"action": "SYNC_MESSAGES_DATA", "messages": messages}
+            writer.write(json.dumps(response).encode("utf-8"))
+            await writer.drain()
+
+    async def initiate_sync_with_peer(self, host: str, port: int):
+        try:
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.write(json.dumps({"action": "SYNC_REQUEST_IDS"}).encode("utf-8"))
+            await writer.drain()
+            data = await reader.read(65536)
+            writer.close()
+            await writer.wait_closed()
+            if not data: return
+            response = json.loads(data.decode("utf-8"))
+            if response.get("action") != "SYNC_IDS_RESPONSE": return
+            peer_ids = set(response.get("ids", []))
+            local_ids = set(await self.get_local_message_ids())
+            missing = list(peer_ids - local_ids)
+            if missing:
+                reader, writer = await asyncio.open_connection(host, port)
+                writer.write(json.dumps({"action": "SYNC_FETCH_MESSAGES", "ids": missing}).encode("utf-8"))
+                await writer.drain()
+                fetch_data = await reader.read(524288)
+                writer.close()
+                await writer.wait_closed()
+                if fetch_data:
+                    fetch_res = json.loads(fetch_data.decode("utf-8"))
+                    for msg in fetch_res.get("messages", []):
+                        if self.verify_packet(msg):
+                            self.seen_messages.add(msg["id"])
+                            await self.db_queue.put(("message", msg))
+                    await self.log_event("INFO", f"Sync: {len(missing)} messages de {host}:{port}")
+        except Exception as e:
+            await self.log_event("WARNING", f"Échec sync {host}:{port} : {e}")
+
+    async def handle_peer(self, reader, writer):
+        data = await reader.read(65536)
+        if not data: return
+        try:
+            packet = json.loads(data.decode("utf-8"))
+            if "action" in packet:
+                await self.handle_sync_handshake(reader, writer, packet)
+                return
+            msg_id = packet.get("id")
+            ttl = packet.get("ttl", 0)
+            if not self.verify_packet(packet):
+                await self.log_event("WARNING", f"Rejet {msg_id} : Signature invalide.")
+                writer.close()
+                await writer.wait_closed()
+                return
+            if msg_id in self.seen_messages or ttl <= 0:
+                writer.close()
+                await writer.wait_closed()
+                return
+            self.seen_messages.add(msg_id)
+            await self.db_queue.put(("message", packet))
+            await self.log_event("INFO", f"Paquet validé : {msg_id}")
+            if ttl > 1:
+                packet["ttl"] = ttl - 1
+                await self.broadcast_packet(packet)
+        except Exception as e:
+            await self.log_event("ERROR", f"Erreur TCP : {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def broadcast_packet(self, packet: dict):
+        payload = json.dumps(packet).encode("utf-8")
+        for peer in self.known_peers:
+            host, port = peer
+            try:
+                _, writer = await asyncio.open_connection(host, port)
+                writer.write(payload)
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def multicast_listener(self):
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except AttributeError:
+            pass
+        sock.bind(('', self.multicast_port))
+        mreq = struct.pack("4sl", socket.inet_aton(self.multicast_group), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.setblocking(False)
+        while self.running:
+            try:
+                data, _ = await loop.sock_recvfrom(sock, 1024)
+                packet = json.loads(data.decode("utf-8"))
+                peer_host, peer_port, peer_pubkey = packet.get("host"), packet.get("port"), packet.get("pubkey")
+                if peer_host and peer_port and peer_pubkey:
+                    peer_endpoint = (peer_host, int(peer_port))
+                    if peer_endpoint != (self.host, self.port) and peer_endpoint not in self.known_peers:
+                        self.known_peers.add(peer_endpoint)
+                        await self.log_event("INFO", f"Pair Multicast : {peer_host}:{peer_port}")
+                        asyncio.create_task(self.initiate_sync_with_peer(peer_host, int(peer_port)))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
+
+    async def multicast_broadcaster(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        while self.running:
+            try:
+                beacon = {"host": self.host, "port": self.port, "pubkey": self.public_key_hex}
+                sock.sendto(json.dumps(beacon).encode("utf-8"), (self.multicast_group, self.multicast_port))
+            except Exception:
+                pass
+            await asyncio.sleep(10)
+
+    async def blockchain_anchor_loop(self, interval_seconds: int = 60):
+        if not self.web3_enabled: return
+        while self.running:
+            await asyncio.sleep(interval_seconds)
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    async with db.execute("SELECT id, sender_pubkey, payload, signature FROM mesh_messages WHERE anchored = 0 LIMIT 20") as cursor:
+                        messages = await cursor.fetchall()
+                        if not messages: continue
+                        hasher = hashlib.sha256()
+                        msg_ids = []
+                        for msg in messages:
+                            m_id, sender, payload, sig = msg
+                            hasher.update(f"{m_id}:{sender}:{payload}:{sig}".encode('utf-8'))
+                            msg_ids.append(m_id)
+                        data_hash_hex = hasher.hexdigest()
+                        batch_id = Web3.keccak(text=f"BATCH_{time.time()}_{data_hash_hex}")
+                        nonce = self.w3.eth.get_transaction_count(self.account.address)
+                        txn = self.contract.functions.anchorBatch(batch_id, bytes.fromhex(data_hash_hex), len(messages)).build_transaction({
+                            'from': self.account.address, 'nonce': nonce, 'gas': 150000, 'gasPrice': self.w3.eth.gas_price})
+                        signed_txn = self.w3.eth.account.sign_transaction(txn, private_key=self.evm_private_key)
+                        tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+                        if receipt.status == 1:
+                            async with aiosqlite.connect(self.db_path) as db2:
+                                await db2.executemany("UPDATE mesh_messages SET anchored = 1 WHERE id = ?", [(m_id,) for m_id in msg_ids])
+                                await db2.commit()
+                            logging.info(f"[ANCRAGE ON-CHAIN] {len(messages)} ancrés. TX: {tx_hash.hex()}")
+            except Exception as e:
+                logging.error(f"[ERREUR ANCORAGE] {e}")
+
+    async def create_packet(self, msg_id: str, payload: dict, ttl: int = 5) -> dict:
+        packet = {"id": msg_id, "sender": self.public_key_hex, "payload": payload, "ttl": ttl}
+        packet["signature"] = self.sign_packet(packet)
+        return packet
+
+    async def start(self):
+        self.running = True
+        await self.initialize_db()
+        self.tasks = [
+            asyncio.create_task(self.db_worker()),
+            asyncio.create_task(self.multicast_listener()),
+            asyncio.create_task(self.multicast_broadcaster()),
+            asyncio.create_task(self.blockchain_anchor_loop())
+        ]
+        server = await asyncio.start_server(self.handle_peer, self.host, self.port)
+        logging.info(f"Sovereign Core Daemon opérationnel sur {self.host}:{self.port} - PubKey: {self.public_key_hex[:16]}...")
+        async with server:
+            await server.serve_forever()
+
+if __name__ == "__main__":
+    daemon = SovereignCoreDaemon(host="127.0.0.1", port=9999, db_path="sovereign_core.db")
+    try:
+        asyncio.run(daemon.start())
+    except KeyboardInterrupt:
+        print("\nArrêt du daemon.")
